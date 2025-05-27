@@ -4,6 +4,30 @@
 
 ## Project Overview
 This project involves creating a music player on an **ESP32** using PlatformIO. The music player plays two audio files stored on an SD card. The playback is controlled via two physical buttons, allowing users to toggle between playing the main music and the background music. Additionally, both tracks can be played simultaneously with mixing functionality when required.
+Chức năng chính:
+
+Phát nhạc: Đọc và phát file gong.wav từ thẻ SD qua I2S khi nhấn nút GPIO_BUTTON.
+Mix âm thanh: Mix file huh.wav khi nhấn nút GPIO_BUTTON_1.
+Bật/tắt: Nhấn lại GPIO_BUTTON để dừng nhạc.
+Đầu ra: Âm thanh được phát qua giao thức I2S (giả sử kết nối với loa hoặc DAC).
+Cấu trúc:
+
+Task:
+audio_processing_task: Đọc file WAV, mix âm thanh, gửi dữ liệu vào queue.
+i2s_output_task: Lấy dữ liệu từ queue và phát qua I2S.
+button_task: Xử lý sự kiện nút bấm qua ISR.
+FreeRTOS Components:
+EventGroup: Quản lý trạng thái (phát nhạc, mixing, dừng).
+Queue: Truyền dữ liệu âm thanh giữa các task.
+Timer: Debounce nút bấm để tránh nhiễu.
+ISR: Xử lý ngắt từ nút bấm.
+Thư viện:
+ESP-IDF: esp_err.h, esp_log.h, driver/i2s.h, driver/gpio.h.
+FreeRTOS: freertos/task.h, freertos/queue.h, freertos/event_groups.h, freertos/timers.h.
+Tùy chỉnh: I2SOutput.h, SDCard.h, SPIFFS.h, WAVFileReader.h, config.h.
+Đặc điểm:
+Tận dụng FreeRTOS: Sử dụng task priority, EventGroup, Queue, Timer, ISR để tối ưu hiệu suất và đồng bộ hóa.
+Đầu ra I2S: Dữ liệu âm thanh được gửi qua I2S, phù hợp với loa hoặc DAC.
 
 ## Project Components
 

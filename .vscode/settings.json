@@ -1,5 +1,5 @@
 {
-  "idf.pythonInstallPath": "/usr/bin/python3",
+  "idf.pythonInstallPath": "C:\\Espressi\\tools\\idf-python\\3.11.2\\python.exe",
   "idf.espIdfPath": "/home/ducanh/esp/esp-idf",
   "idf.toolsPath": "/home/ducanh/.espressif",
   "idf.flashType": "JTAG",
@@ -60,5 +60,5 @@
   "C_Cpp_Runner.showCompilationTime": false,
   "C_Cpp_Runner.useLinkTimeOptimization": false,
   "C_Cpp_Runner.msvcSecureNoWarnings": false,
-  "cmake.sourceDirectory": "/home/ducanh/CODE/FreeRTOS_Audio_Driver_with_Interrupts_ESP32/idf-wav-sdcard/src"
+  "cmake.sourceDirectory": "F:/FreeRTOS_Audio_Driver_with_Interrupts_ESP32"
 }
