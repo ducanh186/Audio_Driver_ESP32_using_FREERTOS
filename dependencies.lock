@@ -1,0 +1,17 @@
+dependencies:
+  esp-libhelix-mp3:
+    dependencies: []
+    source:
+      path: F:\FreeRTOS_Audio_Driver_with_Interrupts_ESP32\components\esp-libhelix-mp3
+      type: local
+    version: 1.0.3
+  idf:
+    source:
+      type: idf
+    version: 5.4.0
+direct_dependencies:
+- chmorgan/esp-libhelix-mp3
+- idf
+manifest_hash: cd999fe8a60d361b16df31d5aae77fa295ff5c48b3b873937aeb9f6baf278a18
+target: esp32
+version: 2.0.0

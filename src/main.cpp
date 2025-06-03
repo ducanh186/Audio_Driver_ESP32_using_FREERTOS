@@ -1,449 +1,484 @@
-#include "esp_err.h"
+#include "audio_player.h"
+#include "esp_check.h"
 #include "esp_log.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/queue.h"
-#include "freertos/event_groups.h"
-#include "freertos/timers.h"
+#include "esp_spiffs.h"
+#include "audio_player.h"
+#include "main.h"
 #include "driver/i2s.h"
 #include "driver/gpio.h"
-#include <dirent.h>
-#include <string.h>
-#include "I2SOutput.h"
-#include "SDCard.h"
-#include "SPIFFS.h"
-#include "WAVFileReader.h"
-#include "config.h"
-#include <string.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "esp_log.h"
-#include "nvs_flash.h"
-#include "sdkconfig.h"
-#include "audio_element.h"
-#include "audio_pipeline.h"
-#include "audio_event_iface.h"
-#include "audio_common.h"
-#include "fatfs_stream.h"
-#include "i2s_stream.h"
-#ifdef CONFIG_AUDIO_SUPPORT_MP3_DECODER
-#include "mp3_decoder.h"
-#elif (CONFIG_AUDIO_SUPPORT_AMRNB_DECODER ||    \
-        CONFIG_AUDIO_SUPPORT_AMRWB_DECODER)
-#include "amr_decoder.h"
-#elif CONFIG_AUDIO_SUPPORT_OPUS_DECODER
-#include "opus_decoder.h"
-#elif CONFIG_AUDIO_SUPPORT_OGG_DECODER
-#include "ogg_decoder.h"
-#elif CONFIG_AUDIO_SUPPORT_FLAC_DECODER
-#include "flac_decoder.h"
-#elif CONFIG_AUDIO_SUPPORT_WAV_DECODER
-#include "wav_decoder.h"
-#elif ((CONFIG_AUDIO_SUPPORT_AAC_DECODER) ||    \
-        (CONFIG_AUDIO_SUPPORT_M4A_DECODER) ||   \
-        (CONFIG_AUDIO_SUPPORT_TS_DECODER) ||    \
-        (CONFIG_AUDIO_SUPPORT_MP4_DECODER))
-#include "aac_decoder.h"
-#endif
-#include "esp_peripherals.h"
-#include "periph_sdcard.h"
-#include "board.h"
 
-
-static const char *TAG = "app";
+static const char *TAG = "mp3_demo";
 extern "C" {
-  void app_main(void);
+    void app_main(void);
+}
+#define USB_HOST_TASK_PRIORITY  5
+#define UAC_TASK_PRIORITY       5
+#define USER_TASK_PRIORITY      2
+#define SPIFFS_BASE             "/spiffs"
+#define MP3_FILE_NAME           "/For_Elise.mp3"
+#define DEFAULT_VOLUME          60
+
+// I2S Configuration
+#define I2S_NUM                 I2S_NUM_0
+#define I2S_BCK_PIN             GPIO_NUM_26
+#define I2S_WS_PIN              GPIO_NUM_25
+#define I2S_DATA_OUT_PIN        GPIO_NUM_22
+#define I2S_SAMPLE_RATE         44100
+#define I2S_SAMPLE_BITS         16
+
+static audio_player_t audio_player_type = AUDIO_PLAYER_I2S;
+static QueueHandle_t s_event_queue = NULL;
+static uac_host_device_handle_t s_audio_player_handle = NULL;
+static audio_player_config_t player_config = {0};
+static FILE *s_fp = NULL;
+static file_iterator_instance_t *file_iterator = NULL;
+static uint8_t current_volume = DEFAULT_VOLUME;
+
+/**
+ * @brief event group
+ */
+typedef enum {
+    APP_EVENT = 0,
+    UAC_DRIVER_EVENT,
+    UAC_DEVICE_EVENT,
+} event_group_t;
+
+typedef struct {
+    event_group_t event_group;
+    union {
+        struct {
+            uint8_t addr;
+            uint8_t iface_num;
+            uac_host_driver_event_t event;
+            void *arg;
+        } driver_evt;
+        struct {
+            uac_host_device_handle_t handle;
+            uac_host_driver_event_t event;
+            void *arg;
+        } device_evt;
+    };
+} s_event_queue_t;
+
+// I2S initialization function
+static esp_err_t i2s_init(void)
+{
+    i2s_config_t i2s_config = {
+        .mode = I2S_MODE_MASTER | I2S_MODE_TX,
+        .sample_rate = I2S_SAMPLE_RATE,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+        .tx_desc_auto_clear = true,
+        .dma_buf_count = 8,
+        .dma_buf_len = 1024,
+        .use_apll = false,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL2
+    };
+
+    i2s_pin_config_t pin_config = {
+        .bck_io_num = I2S_BCK_PIN,
+        .ws_io_num = I2S_WS_PIN,
+        .data_out_num = I2S_DATA_OUT_PIN,
+        .data_in_num = I2S_PIN_NO_CHANGE
+    };
+
+    esp_err_t ret = i2s_driver_install(I2S_NUM, &i2s_config, 0, NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to install I2S driver: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = i2s_set_pin(I2S_NUM, &pin_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set I2S pins: %s", esp_err_to_name(ret));
+        i2s_driver_uninstall(I2S_NUM);
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "I2S initialized successfully");
+    return ESP_OK;
 }
 
-/*Task:
-+ audio_processing_task: Đọc file WAV, mix âm thanh, gửi dữ liệu vào queue.
-+ i2s_output_task: Lấy dữ liệu từ queue và phát qua I2S.
-+ button_task: Xử lý sự kiện nút bấm qua ISR.
-*/
-// Định nghĩa hằng số
-#define SAMPLE_RATE 44100
-#define BUFFER_SIZE 1024
-#define QUEUE_SIZE 20 // Tăng kích thước queue để giảm underrun
-#define DEBOUNCE_TIME_MS 500 //Thời gian debounce (500ms) để loại bỏ nhiễu khi nhấn nút.
+// Simple I2S write function
+static esp_err_t i2s_write_data(void *audio_buffer, size_t len, size_t *bytes_written, uint32_t timeout_ms)
+{
+    esp_err_t ret = i2s_write(I2S_NUM, audio_buffer, len, bytes_written, pdMS_TO_TICKS(timeout_ms));
+    return ret;
+}
 
-// Biến toàn cục FreeRTOS
-static QueueHandle_t audio_queue;
-static EventGroupHandle_t event_group; //EventGroup để đồng bộ hóa trạng thái (phát, mix, dừng).
-static TimerHandle_t debounce_timer; //Timer phần mềm để debounce nút bấm.
-
-// Event Bits
-#define BIT_MUSIC_PLAYING (1 << 0)
-#define BIT_MIX_REQUESTED (1 << 1)
-#define BIT_BUTTON_PLAY (1 << 2)
-#define BIT_BUTTON_MIX (1 << 3)
-#define BIT_STOP_REQUESTED (1 << 4)
-
-// ISR cho nút bấm
-/*   ISR (Interrupt Service Routine)
-Phản ứng nhanh với sự kiện phần cứng (như nhấn nút) mà không cần thăm dò (polling) liên tục, tiết kiệm CPU.
-IRAM (Internal RAM) 
-ISR tiêu tốn IRAM, giới hạn trên ESP32 (128 KB IRAM).
-*/
-void IRAM_ATTR button_play_isr_handler(void *arg) {
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xEventGroupSetBitsFromISR(event_group, BIT_BUTTON_PLAY, &xHigherPriorityTaskWoken);
-    if (xHigherPriorityTaskWoken) {
-        portYIELD_FROM_ISR();
+// Simple volume control (software scaling)
+static void apply_volume_scaling(int16_t *samples, size_t sample_count, uint8_t volume)
+{
+    if (volume > 100) volume = 100;
+    float scale = (float)volume / 100.0f;
+    
+    for (size_t i = 0; i < sample_count; i++) {
+        samples[i] = (int16_t)((float)samples[i] * scale);
     }
 }
 
-void IRAM_ATTR button_mix_isr_handler(void *arg) {
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xEventGroupSetBitsFromISR(event_group, BIT_BUTTON_MIX, &xHigherPriorityTaskWoken);
-    if (xHigherPriorityTaskWoken) {
-        portYIELD_FROM_ISR();
-    }
-}
-
-// Callback cho timer debounce
-void debounce_timer_callback(TimerHandle_t xTimer) {
-}
-
-// Task đọc và mixing âm thanh
-void audio_processing_task(void *pvParameters) {
-    I2SOutput *output = new I2SOutput(I2S_NUM_0, i2s_speaker_pins);
-    int16_t *main_buf = (int16_t *)malloc(BUFFER_SIZE * sizeof(int16_t));
-    int16_t *mix_buf = (int16_t *)malloc(BUFFER_SIZE * sizeof(int16_t));
-    int16_t *output_buf = (int16_t *)malloc(BUFFER_SIZE * sizeof(int16_t));
-    if (!main_buf || !mix_buf || !output_buf) {
-        ESP_LOGE(TAG, "Not enough memory for buffers");
-        delete output;
-        vTaskDelete(NULL);
-    }
-
-    FILE *main_fp = fopen("/sdcard/gong.wav", "rb");
-    FILE *mix_fp = fopen("/sdcard/huh.wav", "rb");
-    if (!main_fp || !mix_fp) {
-        ESP_LOGE(TAG, "Cannot open WAV files");
-        if (main_fp) fclose(main_fp);
-        if (mix_fp) fclose(mix_fp);
-        free(main_buf); free(mix_buf); free(output_buf);
-        delete output;
-        vTaskDelete(NULL);
-    }
-
-    WAVFileReader *main_reader = new WAVFileReader(main_fp);
-    WAVFileReader *mix_reader = new WAVFileReader(mix_fp);
-
-    ESP_LOGI(TAG, "Sample rate: %d", main_reader->sample_rate());
-    output->start(main_reader->sample_rate());
-
-    while (xEventGroupGetBits(event_group) & BIT_MUSIC_PLAYING) {
-        if (xEventGroupGetBits(event_group) & BIT_STOP_REQUESTED) {
-            break;
-        }
-
-        int main_samples = main_reader->read(main_buf, BUFFER_SIZE);
-        if (main_samples <= 0) break;
-
-        if (xEventGroupGetBits(event_group) & BIT_MIX_REQUESTED) {
-            int mix_samples = mix_reader->read(mix_buf, main_samples);
-            for (int i = 0; i < main_samples; i++) {
-                if (i < mix_samples) {
-                    int32_t mixed = (int32_t)main_buf[i] + (int32_t)mix_buf[i];
-                    output_buf[i] = (int16_t)(mixed / 2);
-                } else {
-                    output_buf[i] = main_buf[i];
-                }
-            }
-            if (mix_samples < main_samples) {
-                xEventGroupClearBits(event_group, BIT_MIX_REQUESTED);
-                fseek(mix_fp, 44, SEEK_SET);
-            }
+static esp_err_t _audio_player_mute_fn(AUDIO_PLAYER_MUTE_SETTING setting)
+{
+    esp_err_t ret = ESP_OK;
+    if (audio_player_type == AUDIO_PLAYER_I2S) {
+        // For I2S, we can implement mute by setting volume to 0 or stopping I2S
+        if (setting == AUDIO_PLAYER_MUTE) {
+            ESP_LOGI(TAG, "Audio muted");
+            // Could pause I2S or set a mute flag
         } else {
-            memcpy(output_buf, main_buf, main_samples * sizeof(int16_t));
+            ESP_LOGI(TAG, "Audio unmuted");
         }
-
-        // Dùng xQueueOverwrite để ưu tiên dữ liệu mới nếu queue đầy
-        if (!xQueueOverwrite(audio_queue, output_buf)) {
-            ESP_LOGW(TAG, "Queue full, overwriting data");
-        }
-    }
-
-    output->stop();
-    delete main_reader;
-    delete mix_reader;
-    fclose(main_fp);
-    fclose(mix_fp);
-    free(main_buf); free(mix_buf); free(output_buf);
-    delete output;
-    xEventGroupClearBits(event_group, BIT_MUSIC_PLAYING | BIT_STOP_REQUESTED);
-    vTaskDelete(NULL);
-}
-
-// Task phát âm thanh qua I2S
-void i2s_output_task(void *pvParameters) {
-    int16_t *buffer = (int16_t *)malloc(BUFFER_SIZE * sizeof(int16_t));
-    if (!buffer) {
-        ESP_LOGE(TAG, "Not enough memory for buffer");
-        vTaskDelete(NULL);
-    }
-
-    while (xEventGroupGetBits(event_group) & BIT_MUSIC_PLAYING) {
-        if (xQueueReceive(audio_queue, buffer, portMAX_DELAY) == pdTRUE) {
-            size_t bytes_written;
-            i2s_write(I2S_NUM_0, buffer, BUFFER_SIZE * sizeof(int16_t), &bytes_written, portMAX_DELAY);
-            if (bytes_written != BUFFER_SIZE * sizeof(int16_t)) {
-                ESP_LOGW(TAG, "Not all data written to I2S");
-            }
-        }
-    }
-    free(buffer);
-    vTaskDelete(NULL);
-}
-
-// Task xử lý nút bấm
-void button_task(void *pvParameters) {
-    TickType_t xLastWakeTime = xTaskGetTickCount();
-    while (1) {
-        EventBits_t bits = xEventGroupWaitBits(event_group, BIT_BUTTON_PLAY | BIT_BUTTON_MIX, pdTRUE, pdFALSE, portMAX_DELAY);
-        if (bits & BIT_BUTTON_PLAY) {
-            ESP_LOGI(TAG, "GPIO_BUTTON pressed");
-            if (xEventGroupGetBits(event_group) & BIT_MUSIC_PLAYING) {
-                ESP_LOGI(TAG, "Main music stopping");
-                xEventGroupSetBits(event_group, BIT_STOP_REQUESTED);
-            } else {
-                ESP_LOGI(TAG, "Main music starting");
-                xEventGroupSetBits(event_group, BIT_MUSIC_PLAYING);
-                xTaskCreate(audio_processing_task, "audio_processing_task", 4096, NULL, 5, NULL);
-                xTaskCreate(i2s_output_task, "i2s_output_task", 4096, NULL, 5, NULL);
-            }
-            xTimerStart(debounce_timer, 0); // Bắt đầu timer debounce
-        }
-        if (bits & BIT_BUTTON_MIX) {
-            ESP_LOGI(TAG, "GPIO_BUTTON_1 pressed - mix requested");
-            xEventGroupSetBits(event_group, BIT_MIX_REQUESTED);
-            xTimerStart(debounce_timer, 0);
-        }
-        // Dùng vTaskDelayUntil để kiểm soát tần suất
-        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(10));
-    }
-}
-
-void app_main(void) {
-
-    ESP_LOGI(TAG, "Starting audio player with deep OS integration");
-
-#ifdef USE_SPIFFS
-    ESP_LOGI(TAG, "Mounting SPIFFS on /sdcard");
-    new SPIFFS("/sdcard");
-#else
-    ESP_LOGI(TAG, "Mounting SDCard on /sdcard");
-    new SDCard("/sdcard", PIN_NUM_MISO, PIN_NUM_MOSI, PIN_NUM_CLK, PIN_NUM_CS);
-#endif
-
-    // Kiểm tra nội dung thẻ SD
-    DIR *dir = opendir("/sdcard");
-    if (dir) {
-        struct dirent *ent;
-        while ((ent = readdir(dir)) != NULL) {
-            ESP_LOGI(TAG, "Found file: %s", ent->d_name);
-        }
-        closedir(dir);
+        ret = ESP_OK;
     } else {
-        ESP_LOGE(TAG, "Cannot open /sdcard directory!");
+        if (s_audio_player_handle == NULL) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        ESP_LOGI(TAG, "mute setting: %s", setting == 0 ? "mute" : "unmute");
+        ret = uac_host_device_set_mute(s_audio_player_handle, (setting == 0 ? true : false));
     }
+    return ret;
+}
 
-    // Khởi tạo FreeRTOS components
-    event_group = xEventGroupCreate();
-    audio_queue = xQueueCreate(QUEUE_SIZE, BUFFER_SIZE * sizeof(int16_t));
-    debounce_timer = xTimerCreate("debounce_timer", pdMS_TO_TICKS(DEBOUNCE_TIME_MS), pdFALSE, NULL, debounce_timer_callback);
-
-    // Cấu hình GPIO cho nút bấm
-    gpio_set_direction(GPIO_BUTTON, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(GPIO_BUTTON, GPIO_PULLDOWN_ONLY);
-    gpio_set_direction(GPIO_BUTTON_1, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(GPIO_BUTTON_1, GPIO_PULLDOWN_ONLY);
-    gpio_install_isr_service(0);
-    gpio_isr_handler_add(GPIO_BUTTON, button_play_isr_handler, NULL);
-    gpio_isr_handler_add(GPIO_BUTTON_1, button_mix_isr_handler, NULL);
-
-    // Tạo task xử lý nút bấm
-    xTaskCreate(button_task, "button_task", 2048, NULL, 2, NULL);
-     audio_pipeline_handle_t pipeline;
-    audio_element_handle_t fatfs_stream_reader, i2s_stream_writer, music_decoder;
-
-    esp_log_level_set("*", ESP_LOG_WARN);
-    esp_log_level_set(TAG, ESP_LOG_INFO);
-
-    ESP_LOGI(TAG, "[ 1 ] Mount sdcard");
-    // Initialize peripherals management
-    esp_periph_config_t periph_cfg = DEFAULT_ESP_PERIPH_SET_CONFIG();
-    esp_periph_set_handle_t set = esp_periph_set_init(&periph_cfg);
-
-    // Initialize SD Card peripheral
-    audio_board_sdcard_init(set, SD_MODE_1_LINE);
-
-    ESP_LOGI(TAG, "[ 2 ] Start codec chip");
-    audio_board_handle_t board_handle = audio_board_init();
-    audio_hal_ctrl_codec(board_handle->audio_hal, AUDIO_HAL_CODEC_MODE_DECODE, AUDIO_HAL_CTRL_START);
-
-    ESP_LOGI(TAG, "[3.0] Create audio pipeline for playback");
-    audio_pipeline_cfg_t pipeline_cfg = DEFAULT_AUDIO_PIPELINE_CONFIG();
-    pipeline = audio_pipeline_init(&pipeline_cfg);
-    mem_assert(pipeline);
-
-    ESP_LOGI(TAG, "[3.1] Create fatfs stream to read data from sdcard");
-    fatfs_stream_cfg_t fatfs_cfg = FATFS_STREAM_CFG_DEFAULT();
-    fatfs_cfg.type = AUDIO_STREAM_READER;
-    fatfs_stream_reader = fatfs_stream_init(&fatfs_cfg);
-
-    ESP_LOGI(TAG, "[3.2] Create i2s stream to write data to codec chip");
-    i2s_stream_cfg_t i2s_cfg = I2S_STREAM_CFG_DEFAULT();
-    i2s_cfg.type = AUDIO_STREAM_WRITER;
-    i2s_stream_writer = i2s_stream_init(&i2s_cfg);
-
-#ifdef CONFIG_AUDIO_SUPPORT_MP3_DECODER
-    ESP_LOGI(TAG, "[3.3] Create mp3 decoder");
-    mp3_decoder_cfg_t mp3_cfg = DEFAULT_MP3_DECODER_CONFIG();
-    music_decoder = mp3_decoder_init(&mp3_cfg);
-#elif (CONFIG_AUDIO_SUPPORT_AMRNB_DECODER ||    \
-        CONFIG_AUDIO_SUPPORT_AMRWB_DECODER)
-    ESP_LOGI(TAG, "[3.3] Create amr decoder");
-    amr_decoder_cfg_t  amr_dec_cfg  = DEFAULT_AMR_DECODER_CONFIG();
-    music_decoder = amr_decoder_init(&amr_dec_cfg);
-#elif CONFIG_AUDIO_SUPPORT_OPUS_DECODER
-    ESP_LOGI(TAG, "[3.3] Create opus decoder");
-    opus_decoder_cfg_t opus_dec_cfg = DEFAULT_OPUS_DECODER_CONFIG();
-    music_decoder = decoder_opus_init(&opus_dec_cfg);
-#elif CONFIG_AUDIO_SUPPORT_OGG_DECODER
-    ESP_LOGI(TAG, "[3.3] Create ogg decoder");
-    ogg_decoder_cfg_t  ogg_dec_cfg  = DEFAULT_OGG_DECODER_CONFIG();
-    music_decoder = ogg_decoder_init(&ogg_dec_cfg);
-#elif CONFIG_AUDIO_SUPPORT_FLAC_DECODER
-    ESP_LOGI(TAG, "[3.3] Create flac decoder");
-    flac_decoder_cfg_t flac_dec_cfg = DEFAULT_FLAC_DECODER_CONFIG();
-    music_decoder = flac_decoder_init(&flac_dec_cfg);
-#elif CONFIG_AUDIO_SUPPORT_WAV_DECODER
-    ESP_LOGI(TAG, "[3.3] Create wav decoder");
-    wav_decoder_cfg_t  wav_dec_cfg  = DEFAULT_WAV_DECODER_CONFIG();
-    music_decoder = wav_decoder_init(&wav_dec_cfg);
-#elif ((CONFIG_AUDIO_SUPPORT_AAC_DECODER) ||    \
-        (CONFIG_AUDIO_SUPPORT_M4A_DECODER) ||   \
-        (CONFIG_AUDIO_SUPPORT_TS_DECODER) ||    \
-        (CONFIG_AUDIO_SUPPORT_MP4_DECODER))
-    ESP_LOGI(TAG, "[3.3] Create aac decoder");
-    aac_decoder_cfg_t  aac_dec_cfg  = DEFAULT_AAC_DECODER_CONFIG();
-    music_decoder = aac_decoder_init(&aac_dec_cfg);
-#endif
-
-    ESP_LOGI(TAG, "[3.4] Register all elements to audio pipeline");
-    audio_pipeline_register(pipeline, fatfs_stream_reader, "file");
-    audio_pipeline_register(pipeline, music_decoder, "dec");
-    audio_pipeline_register(pipeline, i2s_stream_writer, "i2s");
-
-    ESP_LOGI(TAG, "[3.5] Link it together [sdcard]-->fatfs_stream-->music_decoder-->i2s_stream-->[codec_chip]");
-    const char *link_tag[3] = {"file", "dec", "i2s"};
-    audio_pipeline_link(pipeline, &link_tag[0], 3);
-
-#ifdef CONFIG_AUDIO_SUPPORT_MP3_DECODER
-    ESP_LOGI(TAG, "[3.6] Set up uri: /sdcard/test.mp3 ");
-    audio_element_set_uri(fatfs_stream_reader, "/sdcard/test.mp3");
-#elif CONFIG_AUDIO_SUPPORT_AMRNB_DECODER
-    ESP_LOGI(TAG, "[3.6] Set up uri: /test.amr");
-    audio_element_set_uri(fatfs_stream_reader, "/sdcard/test.amr");
-#elif CONFIG_AUDIO_SUPPORT_AMRWB_DECODER
-    ESP_LOGI(TAG, "[3.6] Set up uri: /sdcard/test.Wamr");
-    audio_element_set_uri(fatfs_stream_reader, "/sdcard/test.Wamr");
-#elif CONFIG_AUDIO_SUPPORT_OPUS_DECODER
-    ESP_LOGI(TAG, "[3.6] Set up uri: /sdcard/test.opus");
-    audio_element_set_uri(fatfs_stream_reader, "/sdcard/test.opus");
-#elif CONFIG_AUDIO_SUPPORT_OGG_DECODER
-    ESP_LOGI(TAG, "[3.6] Set up uri: /sdcard/test.ogg");
-    audio_element_set_uri(fatfs_stream_reader, "/sdcard/test.ogg");
-#elif CONFIG_AUDIO_SUPPORT_FLAC_DECODER
-    ESP_LOGI(TAG, "[3.6] Set up uri: /sdcard/test.flac");
-    audio_element_set_uri(fatfs_stream_reader, "/sdcard/test.flac");
-#elif CONFIG_AUDIO_SUPPORT_WAV_DECODER
-    ESP_LOGI(TAG, "[3.6] Set up uri: /sdcard/test.wav");
-    audio_element_set_uri(fatfs_stream_reader, "/sdcard/test.wav");
-#elif CONFIG_AUDIO_SUPPORT_AAC_DECODER
-    ESP_LOGI(TAG, "[3.6] Set up uri: /sdcard/test.aac");
-    audio_element_set_uri(fatfs_stream_reader, "/sdcard/test.aac");
-#elif CONFIG_AUDIO_SUPPORT_M4A_DECODER
-    ESP_LOGI(TAG, "[3.6] Set up uri: /sdcard/test.m4a");
-    audio_element_set_uri(fatfs_stream_reader, "/sdcard/test.m4a");
-#elif CONFIG_AUDIO_SUPPORT_TS_DECODER
-    ESP_LOGI(TAG, "[3.6] Set up uri: /sdcard/test.ts");
-    audio_element_set_uri(fatfs_stream_reader, "/sdcard/test.ts");
-#elif CONFIG_AUDIO_SUPPORT_MP4_DECODER
-    ESP_LOGI(TAG, "[3.6] Set up uri: /sdcard/test.mp4");
-    audio_element_set_uri(fatfs_stream_reader, "/sdcard/test.mp4");
-#endif
-
-    ESP_LOGI(TAG, "[ 4 ] Set up  event listener");
-    audio_event_iface_cfg_t evt_cfg = AUDIO_EVENT_IFACE_DEFAULT_CFG();
-    audio_event_iface_handle_t evt = audio_event_iface_init(&evt_cfg);
-
-    ESP_LOGI(TAG, "[4.1] Listening event from all elements of pipeline");
-    audio_pipeline_set_listener(pipeline, evt);
-
-    ESP_LOGI(TAG, "[4.2] Listening event from peripherals");
-    audio_event_iface_set_listener(esp_periph_set_get_event_iface(set), evt);
-
-    ESP_LOGI(TAG, "[ 5 ] Start audio_pipeline");
-    audio_pipeline_run(pipeline);
-    // Example of linking elements into an audio pipeline -- END
-
-    ESP_LOGI(TAG, "[ 6 ] Listen for all pipeline events");
-    while (1) {
-        audio_event_iface_msg_t msg;
-        esp_err_t ret = audio_event_iface_listen(evt, &msg, portMAX_DELAY);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "[ * ] Event interface error : %d", ret);
-            continue;
+static esp_err_t _audio_player_write_fn(void *audio_buffer, size_t len, size_t *bytes_written, uint32_t timeout_ms)
+{
+    esp_err_t ret = ESP_OK;
+    if (audio_player_type == AUDIO_PLAYER_I2S) {
+        // Apply volume scaling for I2S output
+        apply_volume_scaling((int16_t*)audio_buffer, len / sizeof(int16_t), current_volume);
+        ret = i2s_write_data(audio_buffer, len, bytes_written, timeout_ms);
+    } else {
+        if (s_audio_player_handle == NULL) {
+            return ESP_ERR_INVALID_STATE;
         }
-
-        if (msg.source_type == AUDIO_ELEMENT_TYPE_ELEMENT && msg.source == (void *) music_decoder
-            && msg.cmd == AEL_MSG_CMD_REPORT_MUSIC_INFO) {
-            audio_element_info_t music_info = {0};
-            audio_element_getinfo(music_decoder, &music_info);
-
-            ESP_LOGI(TAG, "[ * ] Receive music info from music decoder, sample_rates=%d, bits=%d, ch=%d",
-                     music_info.sample_rates, music_info.bits, music_info.channels);
-
-            audio_element_setinfo(i2s_stream_writer, &music_info);
-            i2s_stream_set_clk(i2s_stream_writer, music_info.sample_rates, music_info.bits, music_info.channels);
-            continue;
+        *bytes_written = 0;
+        ret = uac_host_device_write(s_audio_player_handle, audio_buffer, len, timeout_ms);
+        if (ret == ESP_OK) {
+            *bytes_written = len;
         }
+    }
+    return ret;
+}
 
-        /* Stop when the last pipeline element (i2s_stream_writer in this case) receives stop event */
-        if (msg.source_type == AUDIO_ELEMENT_TYPE_ELEMENT && msg.source == (void *) i2s_stream_writer
-            && msg.cmd == AEL_MSG_CMD_REPORT_STATUS
-            && (((int)msg.data == AEL_STATUS_STATE_STOPPED) || ((int)msg.data == AEL_STATUS_STATE_FINISHED))) {
-            ESP_LOGW(TAG, "[ * ] Stop event received");
+static esp_err_t _audio_player_std_clock(uint32_t rate, uint32_t bits_cfg, i2s_slot_mode_t ch)
+{
+    esp_err_t ret = ESP_OK;
+
+    if (audio_player_type == AUDIO_PLAYER_I2S) {
+        // Reconfigure I2S with new sample rate
+        i2s_set_sample_rates(I2S_NUM, rate);
+        ESP_LOGI(TAG, "I2S reconfigured: rate %"PRIu32", bits %"PRIu32", channels %d", 
+                 rate, bits_cfg, (int)ch);
+    } else {
+        if (s_audio_player_handle == NULL) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        ESP_LOGI(TAG, "Re-config: speaker rate %"PRIu32", bits %"PRIu32", mode %s", 
+                 rate, bits_cfg, ch == 1 ? "MONO" : (ch == 2 ? "STEREO" : "INVALID"));
+        ESP_ERROR_CHECK(uac_host_device_stop(s_audio_player_handle));
+        const uac_host_stream_config_t stm_config = {
+            .channels = ch,
+            .bit_resolution = bits_cfg,
+            .sample_freq = rate,
+        };
+        ret = uac_host_device_start(s_audio_player_handle, &stm_config);
+    }
+    return ret;
+}
+
+static void _audio_player_callback(audio_player_cb_ctx_t *ctx)
+{
+    ESP_LOGI(TAG, "ctx->audio_event = %d", ctx->audio_event);
+    switch (ctx->audio_event) {
+    case AUDIO_PLAYER_CALLBACK_EVENT_IDLE: {
+        ESP_LOGI(TAG, "AUDIO_PLAYER_REQUEST_IDLE");
+        if (s_audio_player_handle != NULL) {
+            ESP_ERROR_CHECK(uac_host_device_suspend(s_audio_player_handle));
+        }
+        ESP_LOGI(TAG, "Play in loop");
+        s_fp = fopen(SPIFFS_BASE MP3_FILE_NAME, "rb");
+        if (s_fp) {
+            ESP_LOGI(TAG, "Playing '%s'", MP3_FILE_NAME);
+            audio_player_play(s_fp);
+        } else {
+            ESP_LOGE(TAG, "unable to open filename '%s'", MP3_FILE_NAME);
+        }
+        break;
+    }
+    case AUDIO_PLAYER_CALLBACK_EVENT_PLAYING:
+        ESP_LOGI(TAG, "AUDIO_PLAYER_REQUEST_PLAY");
+        if (s_audio_player_handle != NULL) {
+            ESP_ERROR_CHECK(uac_host_device_resume(s_audio_player_handle));
+            uac_host_device_set_volume(s_audio_player_handle, current_volume);
+        }
+        break;
+    case AUDIO_PLAYER_CALLBACK_EVENT_PAUSE:
+        ESP_LOGI(TAG, "AUDIO_PLAYER_REQUEST_PAUSE");
+        break;
+    default:
+        break;
+    }
+}
+
+static void uac_device_callback(uac_host_device_handle_t uac_device_handle, const uac_host_device_event_t event, void *arg)
+{
+    if (event == UAC_HOST_DRIVER_EVENT_DISCONNECTED) {
+        audio_player_type = AUDIO_PLAYER_I2S;
+        s_audio_player_handle = NULL;
+        ESP_LOGI(TAG, "UAC Device disconnected, switching to I2S");
+        ESP_ERROR_CHECK(uac_host_device_close(uac_device_handle));
+        return;
+    }
+    
+    s_event_queue_t evt_queue = {
+        .event_group = UAC_DEVICE_EVENT,
+        .device_evt.handle = uac_device_handle,
+        .device_evt.event = event,
+        .device_evt.arg = arg
+    };
+    xQueueSend(s_event_queue, &evt_queue, 0);
+}
+
+static void uac_host_lib_callback(uint8_t addr, uint8_t iface_num, const uac_host_driver_event_t event, void *arg)
+{
+    s_event_queue_t evt_queue = {
+        .event_group = UAC_DRIVER_EVENT,
+        .driver_evt.addr = addr,
+        .driver_evt.iface_num = iface_num,
+        .driver_evt.event = event,
+        .driver_evt.arg = arg
+    };
+    xQueueSend(s_event_queue, &evt_queue, 0);
+}
+
+static void usb_lib_task(void *arg)
+{
+    const usb_host_config_t host_config = {
+        .skip_phy_setup = false,
+        .intr_flags = ESP_INTR_FLAG_LEVEL2,
+    };
+
+    ESP_ERROR_CHECK(usb_host_install(&host_config));
+    ESP_LOGI(TAG, "USB Host installed");
+    xTaskNotifyGive(arg);
+
+    while (true) {
+        uint32_t event_flags;
+        usb_host_lib_handle_events(portMAX_DELAY, &event_flags);
+        if (event_flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) {
+            ESP_ERROR_CHECK(usb_host_device_free_all());
             break;
         }
     }
 
-    ESP_LOGI(TAG, "[ 7 ] Stop audio_pipeline");
-    audio_pipeline_stop(pipeline);
-    audio_pipeline_wait_for_stop(pipeline);
-    audio_pipeline_terminate(pipeline);
+    ESP_LOGI(TAG, "USB Host shutdown");
+    vTaskDelay(10);
+    ESP_ERROR_CHECK(usb_host_uninstall());
+    vTaskDelete(NULL);
+}
 
-    audio_pipeline_unregister(pipeline, fatfs_stream_reader);
-    audio_pipeline_unregister(pipeline, i2s_stream_writer);
-    audio_pipeline_unregister(pipeline, music_decoder);
+static void uac_lib_task(void *arg)
+{
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    uac_host_driver_config_t uac_config = {
+        .create_background_task = true,
+        .task_priority = UAC_TASK_PRIORITY,
+        .stack_size = 4096,
+        .core_id = 0,
+        .callback = uac_host_lib_callback,
+        .callback_arg = NULL
+    };
 
-    /* Terminal the pipeline before removing the listener */
-    audio_pipeline_remove_listener(pipeline);
+    ESP_ERROR_CHECK(uac_host_install(&uac_config));
+    ESP_LOGI(TAG, "UAC Class Driver installed");
+    
+    s_event_queue_t evt_queue = {0};
+    while (1) {
+        if (xQueueReceive(s_event_queue, &evt_queue, pdMS_TO_TICKS(100))) {
+            if (UAC_DRIVER_EVENT == evt_queue.event_group) {
+                uac_host_driver_event_t event = evt_queue.driver_evt.event;
+                uint8_t addr = evt_queue.driver_evt.addr;
+                uint8_t iface_num = evt_queue.driver_evt.iface_num;
+                
+                switch (event) {
+                case UAC_HOST_DRIVER_EVENT_TX_CONNECTED: {
+                    audio_player_type = AUDIO_PLAYER_USB;
+                    uac_host_dev_info_t dev_info;
+                    uac_host_device_handle_t uac_device_handle = NULL;
+                    const uac_host_device_config_t dev_config = {
+                        .addr = addr,
+                        .iface_num = iface_num,
+                        .buffer_size = 16000,
+                        .buffer_threshold = 4000,
+                        .callback = uac_device_callback,
+                        .callback_arg = NULL,
+                    };
+                    ESP_ERROR_CHECK(uac_host_device_open(&dev_config, &uac_device_handle));
+                    ESP_ERROR_CHECK(uac_host_get_device_info(uac_device_handle, &dev_info));
+                    ESP_LOGI(TAG, "UAC Device connected: SPK");
+                    uac_host_printf_device_param(uac_device_handle);
+                    
+                    const uac_host_stream_config_t stm_config = {
+                        .channels = 2,
+                        .bit_resolution = 16,
+                        .sample_freq = 48000,
+                    };
+                    ESP_ERROR_CHECK(uac_host_device_start(uac_device_handle, &stm_config));
+                    s_audio_player_handle = uac_device_handle;
+                    uac_host_device_set_volume(s_audio_player_handle, current_volume);
+                    
+                    s_fp = fopen(SPIFFS_BASE MP3_FILE_NAME, "rb");
+                    if (s_fp) {
+                        ESP_LOGI(TAG, "Playing '%s'", MP3_FILE_NAME);
+                        audio_player_play(s_fp);
+                    } else {
+                        ESP_LOGE(TAG, "unable to open filename '%s'", MP3_FILE_NAME);
+                    }
+                    break;
+                }
+                case UAC_HOST_DRIVER_EVENT_RX_CONNECTED: {
+                    ESP_LOGI(TAG, "UAC Device connected: MIC (not supported in this example)");
+                    break;
+                }
+                default:
+                    break;
+                }
+            } else if (UAC_DEVICE_EVENT == evt_queue.event_group) {
+                uac_host_device_event_t event = evt_queue.device_evt.event;
+                switch (event) {
+                case UAC_HOST_DRIVER_EVENT_DISCONNECTED:
+                    ESP_LOGI(TAG, "UAC Device disconnected");
+                    break;
+                case UAC_HOST_DEVICE_EVENT_RX_DONE:
+                case UAC_HOST_DEVICE_EVENT_TX_DONE:
+                case UAC_HOST_DEVICE_EVENT_TRANSFER_ERROR:
+                    break;
+                default:
+                    break;
+                }
+            } else if (APP_EVENT == evt_queue.event_group) {
+                break;
+            }
+        }
+    }
 
-    /* Stop all periph before removing the listener */
-    esp_periph_set_stop_all(set);
-    audio_event_iface_remove_listener(esp_periph_set_get_event_iface(set), evt);
+    ESP_LOGI(TAG, "UAC Driver uninstall");
+    ESP_ERROR_CHECK(uac_host_uninstall());
+}
 
-    /* Make sure audio_pipeline_remove_listener & audio_event_iface_remove_listener are called before destroying event_iface */
-    audio_event_iface_destroy(evt);
+// Simple SPIFFS mount function
+static esp_err_t spiffs_init(void)
+{
+    esp_vfs_spiffs_conf_t conf = {
+        .base_path = SPIFFS_BASE,
+        .partition_label = NULL,
+        .max_files = 5,
+        .format_if_mount_failed = false
+    };
+    
+    esp_err_t ret = esp_vfs_spiffs_register(&conf);
+    if (ret != ESP_OK) {
+        if (ret == ESP_FAIL) {
+            ESP_LOGE(TAG, "Failed to mount or format filesystem");
+        } else if (ret == ESP_ERR_NOT_FOUND) {
+            ESP_LOGE(TAG, "Failed to find SPIFFS partition");
+        } else {
+            ESP_LOGE(TAG, "Failed to initialize SPIFFS (%s)", esp_err_to_name(ret));
+        }
+        return ret;
+    }
+    
+    size_t total = 0, used = 0;
+    ret = esp_spiffs_info(NULL, &total, &used);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to get SPIFFS partition information (%s)", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "Partition size: total: %d, used: %d", total, used);
+    }
+    
+    return ESP_OK;
+}
 
-    /* Release all resources */
-    audio_pipeline_deinit(pipeline);
-    audio_element_deinit(fatfs_stream_reader);
-    audio_element_deinit(i2s_stream_writer);
-    audio_element_deinit(music_decoder);
-    esp_periph_set_destroy(set);
+// Public API functions
+audio_player_t get_audio_player_type(void)
+{
+    return audio_player_type;
+}
+
+uac_host_device_handle_t get_audio_player_handle(void)
+{
+    return s_audio_player_handle;
+}
+
+uint8_t get_sys_volume(void)
+{
+    return current_volume;
+}
+
+void set_sys_volume(uint8_t volume)
+{
+    if (volume > 100) volume = 100;
+    current_volume = volume;
+    ESP_LOGI(TAG, "Volume set to %d%%", volume);
+    
+    if (s_audio_player_handle != NULL) {
+        uac_host_device_set_volume(s_audio_player_handle, volume);
+    }
+}
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "Starting MP3 Audio Player");
+    
+    // Create event queue
+    s_event_queue = xQueueCreate(10, sizeof(s_event_queue_t));
+    assert(s_event_queue != NULL);
+
+    // Initialize SPIFFS
+    ESP_ERROR_CHECK(spiffs_init());
+
+    // Initialize file iterator
+    file_iterator = file_iterator_new(SPIFFS_BASE);
+    assert(file_iterator != NULL);
+
+    // Initialize I2S
+    ESP_ERROR_CHECK(i2s_init());
+
+    // Initialize audio player
+    player_config.mute_fn = _audio_player_mute_fn;
+    player_config.write_fn = _audio_player_write_fn;
+    player_config.clk_set_fn = _audio_player_std_clock;
+    player_config.priority = 1;
+
+    ESP_ERROR_CHECK(audio_player_new(player_config));
+    ESP_ERROR_CHECK(audio_player_callback_register(_audio_player_callback, NULL));
+
+    // Create UAC and USB tasks
+    static TaskHandle_t uac_task_handle = NULL;
+    BaseType_t ret = xTaskCreatePinnedToCore(uac_lib_task, "uac_events", 4096, NULL,
+                                             USER_TASK_PRIORITY, &uac_task_handle, 1);
+    assert(ret == pdTRUE);
+    
+    ret = xTaskCreatePinnedToCore(usb_lib_task, "usb_events", 4096, (void *)uac_task_handle,
+                                  USB_HOST_TASK_PRIORITY, NULL, 1);
+    assert(ret == pdTRUE);
+
+    // Start playing audio file automatically
+    vTaskDelay(pdMS_TO_TICKS(1000)); // Wait for initialization
+    
+    s_fp = fopen(SPIFFS_BASE MP3_FILE_NAME, "rb");
+    if (s_fp) {
+        ESP_LOGI(TAG, "Auto-playing '%s'", MP3_FILE_NAME);
+        audio_player_play(s_fp);
+    } else {
+        ESP_LOGE(TAG, "Unable to open filename '%s'", MP3_FILE_NAME);
+    }
+
+    ESP_LOGI(TAG, "MP3 Audio Player initialized successfully");
+    
+    // Main loop - could add console commands or other control logic here
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        // Add any periodic tasks or status updates here
+    }
 }
