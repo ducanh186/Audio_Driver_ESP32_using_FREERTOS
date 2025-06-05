@@ -22,3 +22,15 @@ i2s_pin_config_t i2s_speaker_pins = {
     .data_out_num = I2S_SPEAKER_SERIAL_DATA,
     .data_in_num  = I2S_PIN_NO_CHANGE
 };
+static void gpio_buttons_init() {
+    gpio_config_t io_conf = {
+        .intr_type    = GPIO_INTR_DISABLE,
+        .mode         = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL<<BTN_PAUSE_GPIO) 
+                      | (1ULL<<BTN_NEXT_GPIO) 
+                      | (1ULL<<BTN_BACK_GPIO),
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .pull_up_en   = GPIO_PULLUP_ENABLE
+    };
+    gpio_config(&io_conf);
+}
