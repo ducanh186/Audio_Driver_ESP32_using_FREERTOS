@@ -1,6 +1,4 @@
-
 #include <stdio.h>
-//#include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_err.h"
@@ -8,17 +6,23 @@
 #include "esp_spiffs.h"
 #include "driver/i2s.h"
 #include "audio_player.h"
-#include "config.h"   
+#include "config.h"    
 
 static const char *TAG = "mp3_i2s_player";
-// extern "C" {
-//     void app_main(void);
-// }
-// Đường dẫn file MP3 trong SPIFFS
 #define MP3_FILE_PATH  "/spiffs/new_epic.mp3"
 
-// File handle để có thể replay khi end-of-file
 static FILE *mp3_fp = NULL;
+
+static bool i2s_initialized = false;
+
+/**
+ * @brief Dummy mute function 
+ */
+static esp_err_t _audio_player_mute_fn(AUDIO_PLAYER_MUTE_SETTING setting)
+{
+    ESP_LOGI(TAG, "Mute callback: %s", (setting == AUDIO_PLAYER_UNMUTE) ? "UNMUTE" : "MUTE");
+    return ESP_OK;
+}
 
 /**
  * @brief write_fn cho audio_player: nhận buffer PCM và ghi qua I2S.
@@ -28,8 +32,12 @@ static esp_err_t _audio_player_write_fn(void *audio_buffer,
                                         size_t *bytes_written,
                                         uint32_t timeout_ms)
 {
+    if (!i2s_initialized) {
+        *bytes_written = 0;
+        return ESP_ERR_INVALID_STATE;
+    }
+
     size_t out_bytes = 0;
-    // Ghi block đến khi xong toàn bộ len byte
     esp_err_t err = i2s_write(I2S_NUM_0, audio_buffer, len, &out_bytes, portMAX_DELAY);
     if (err == ESP_OK) {
         *bytes_written = out_bytes;
@@ -47,18 +55,20 @@ static esp_err_t _audio_player_clk_set(uint32_t sample_rate,
                                        uint32_t bits_cfg,
                                        i2s_slot_mode_t ch)
 {
-    ESP_LOGI(TAG, "audio_player requests reconfig I2S: %d Hz, %d-bit, %s",
+    ESP_LOGI(TAG, "audio_player requests reconfig I2S: %u Hz, %u-bit, %s",
              sample_rate,
              bits_cfg,
              (ch == 2) ? "stereo" : "mono");
 
-    // Gỡ driver cũ
-    i2s_driver_uninstall(I2S_NUM_0);
+    // Nếu chưa khởi tạo I2S trước đó, đánh dấu rằng đã khởi để sau này uninstall
+    if (i2s_initialized) {
+        i2s_driver_uninstall(I2S_NUM_0);
+        i2s_initialized = false;
+    }
 
-    // Cập nhật lại cấu hình
+    // Cập nhật lại cấu hình dựa trên sample_rate và bits_cfg
     i2s_speaker_config.sample_rate = sample_rate;
 
-    // Chuyển bits_cfg về enum phù hợp
     if (bits_cfg == 16) {
         i2s_speaker_config.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
     } else if (bits_cfg == 24) {
@@ -66,33 +76,48 @@ static esp_err_t _audio_player_clk_set(uint32_t sample_rate,
     } else if (bits_cfg == 32) {
         i2s_speaker_config.bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT;
     } else {
-        ESP_LOGW(TAG, "Unsupported bits_cfg %d, defaulting to 16", bits_cfg);
+        ESP_LOGW(TAG, "Unsupported bits_cfg %u, defaulting to 16", bits_cfg);
         i2s_speaker_config.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
     }
 
-    // Mono (MAX98357A) hoặc stereo
     if (ch == 2) {
         i2s_speaker_config.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
     } else {
         i2s_speaker_config.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
     }
 
-    // Cài đặt driver mới với config vừa cập nhật
+    // Cài đặt driver I2S mới với cấu hình đã cập nhật
     esp_err_t err = i2s_driver_install(I2S_NUM_0, &i2s_speaker_config, 0, NULL);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "i2s_driver_install failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "i2s_driver_install failed (reconfig): %s", esp_err_to_name(err));
         return err;
     }
+    i2s_initialized = true;
 
     // Gán chân I2S
     err = i2s_set_pin(I2S_NUM_0, &i2s_speaker_pins);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "i2s_set_pin failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "i2s_set_pin failed (reconfig): %s", esp_err_to_name(err));
         return err;
     }
 
     ESP_LOGI(TAG, "I2S reconfigured successfully");
     return ESP_OK;
+}
+static void _replay_task(void *param)
+{
+    vTaskDelay(pdMS_TO_TICKS(5000));  // Đợi 5 giây
+
+    FILE *fp = fopen(MP3_FILE_PATH, "rb");
+    if (fp) {
+        ESP_LOGI(TAG, "Replaying MP3 after 5 seconds...");
+        mp3_fp = fp;  // Cập nhật biến toàn cục nếu cần dùng lại
+        audio_player_play(fp);
+    } else {
+        ESP_LOGE(TAG, "Cannot reopen MP3 for replay");
+    }
+
+    vTaskDelete(NULL);  // Xoá task sau khi xong
 }
 
 /**
@@ -102,16 +127,8 @@ static esp_err_t _audio_player_clk_set(uint32_t sample_rate,
 static void _audio_player_event_cb(audio_player_cb_ctx_t *ctx)
 {
     if (ctx->audio_event == AUDIO_PLAYER_CALLBACK_EVENT_IDLE) {
-        ESP_LOGI(TAG, "Reached end of MP3, replaying...");
-        if (mp3_fp) {
-            fclose(mp3_fp);
-        }
-        mp3_fp = fopen(MP3_FILE_PATH, "rb");
-        if (mp3_fp) {
-            audio_player_play(mp3_fp);
-        } else {
-            ESP_LOGE(TAG, "Cannot reopen MP3: %s", MP3_FILE_PATH);
-        }
+        ESP_LOGI(TAG, "Reached end of MP3, scheduling replay after 5 seconds...");
+        xTaskCreate(_replay_task, "replay_task", 2048, NULL, 5, NULL);
     }
 }
 
@@ -138,20 +155,20 @@ void app_main(void)
     // 2. Khởi tạo I2S (mặc định 44100 Hz, 16-bit, mono)
     {
         i2s_config_t init_conf = i2s_speaker_config;
-        init_conf.sample_rate = SAMPLE_RATE;                   // 44100
-        init_conf.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT; // 16-bit
-        init_conf.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;  // Mono
+        init_conf.sample_rate = SAMPLE_RATE;                   
+        init_conf.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;  // 16-bit
+        init_conf.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;   // mono
 
-        // Gỡ driver cũ (nếu có)
-        i2s_driver_uninstall(I2S_NUM_0);
-
-        // Cài driver I2S
+        if (i2s_initialized) {
+            i2s_driver_uninstall(I2S_NUM_0);
+            i2s_initialized = false;
+        }
         err = i2s_driver_install(I2S_NUM_0, &init_conf, 0, NULL);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "i2s_driver_install failed: %s", esp_err_to_name(err));
             return;
         }
-        // Gán chân
+        i2s_initialized = true;
         err = i2s_set_pin(I2S_NUM_0, &i2s_speaker_pins);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "i2s_set_pin failed: %s", esp_err_to_name(err));
@@ -160,13 +177,12 @@ void app_main(void)
         ESP_LOGI(TAG, "I2S initialized: %d Hz, 16-bit, mono", SAMPLE_RATE);
     }
 
-    // 3. Khởi tạo audio_player (chỉ decode MP3 → I2S)
     {
         audio_player_config_t player_cfg = {
-            .mute_fn    = NULL,                 // Không dùng mute hardware
+            .mute_fn    = _audio_player_mute_fn,
             .write_fn   = _audio_player_write_fn,
             .clk_set_fn = _audio_player_clk_set,
-            .priority   = 4
+            .priority   = 11
         };
         err = audio_player_new(player_cfg);
         if (err != ESP_OK) {
@@ -175,8 +191,6 @@ void app_main(void)
         }
         audio_player_callback_register(_audio_player_event_cb, NULL);
     }
-
-    // 4. Mở file MP3 và phát
     mp3_fp = fopen(MP3_FILE_PATH, "rb");
     if (!mp3_fp) {
         ESP_LOGE(TAG, "Cannot open MP3 file: %s", MP3_FILE_PATH);
@@ -185,7 +199,6 @@ void app_main(void)
     ESP_LOGI(TAG, "Playing MP3: %s", MP3_FILE_PATH);
     audio_player_play(mp3_fp);
 
-    // 5. Giữ app_main chạy để audio_player có thời gian decode & gửi I2S
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
