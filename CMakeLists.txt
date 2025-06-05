@@ -1,3 +1,5 @@
-cmake_minimum_required(VERSION 3.16.0)
+
+cmake_minimum_required(VERSION 3.5)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(${CMAKE_PROJECT_NAME})
+add_compile_options(-Wno-ignored-qualifier-Wno-dev)
+project(usb_audio_player)

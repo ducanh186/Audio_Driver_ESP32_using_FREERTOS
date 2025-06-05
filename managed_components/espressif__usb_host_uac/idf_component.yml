@@ -1,0 +1,10 @@
+dependencies:
+  cmake_utilities: 0.5.*
+  idf: '>=4.4'
+description: USB Host UAC driver
+repository: git://github.com/espressif/esp-usb.git
+repository_info:
+  commit_sha: 8128828d7b2558d77cb865dfd47bee6fb75450e0
+  path: host/class/uac/usb_host_uac
+url: https://github.com/espressif/esp-usb/tree/master/host/class/uac/usb_host_uac
+version: 1.3.0

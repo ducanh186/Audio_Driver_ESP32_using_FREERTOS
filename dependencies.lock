@@ -1,17 +1,60 @@
 dependencies:
-  esp-libhelix-mp3:
-    dependencies: []
+  chmorgan/esp-audio-player:
+    component_hash: c8ac1998e9af863bc41b57e592f88d1a5791a0f891485122336ddabbf7a65033
+    dependencies:
+    - name: chmorgan/esp-libhelix-mp3
+      registry_url: https://components.espressif.com
+      require: private
+      version: '>=1.0.0,<2.0.0'
+    - name: idf
+      require: private
+      version: '>=5.0'
     source:
-      path: F:\FreeRTOS_Audio_Driver_with_Interrupts_ESP32\components\esp-libhelix-mp3
-      type: local
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.0.7
+  chmorgan/esp-libhelix-mp3:
+    component_hash: cbb76089dc2c5749f7b470e2e70aedc44c9da519e04eb9a67d4c7ec275229e53
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.1.0'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
     version: 1.0.3
+  espressif/cmake_utilities:
+    component_hash: 351350613ceafba240b761b4ea991e0f231ac7a9f59a9ee901f751bddc0bb18f
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.1'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 0.5.3
+  espressif/usb_host_uac:
+    component_hash: 36e1f7cf037a7ec7ea9bb8d5f40f5a39290bc67935c34f9f3dbdbfdd00406488
+    dependencies:
+    - name: espressif/cmake_utilities
+      registry_url: https://components.espressif.com
+      require: private
+      version: 0.5.*
+    - name: idf
+      require: private
+      version: '>=4.4'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.3.0
   idf:
     source:
       type: idf
-    version: 5.4.0
+    version: 5.3.1
 direct_dependencies:
-- chmorgan/esp-libhelix-mp3
+- chmorgan/esp-audio-player
+- espressif/usb_host_uac
 - idf
-manifest_hash: cd999fe8a60d361b16df31d5aae77fa295ff5c48b3b873937aeb9f6baf278a18
-target: esp32
+manifest_hash: 8176d48e94550bf4ea57cf90f5349bab0bc90306a0a31c0d058bcf3b510fc7a2
+target: esp32s3
 version: 2.0.0
