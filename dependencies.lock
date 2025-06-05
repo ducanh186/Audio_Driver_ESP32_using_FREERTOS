@@ -23,38 +23,13 @@ dependencies:
       registry_url: https://components.espressif.com
       type: service
     version: 1.0.3
-  espressif/cmake_utilities:
-    component_hash: 351350613ceafba240b761b4ea991e0f231ac7a9f59a9ee901f751bddc0bb18f
-    dependencies:
-    - name: idf
-      require: private
-      version: '>=4.1'
-    source:
-      registry_url: https://components.espressif.com
-      type: service
-    version: 0.5.3
-  espressif/usb_host_uac:
-    component_hash: 36e1f7cf037a7ec7ea9bb8d5f40f5a39290bc67935c34f9f3dbdbfdd00406488
-    dependencies:
-    - name: espressif/cmake_utilities
-      registry_url: https://components.espressif.com
-      require: private
-      version: 0.5.*
-    - name: idf
-      require: private
-      version: '>=4.4'
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    version: 1.3.0
   idf:
     source:
       type: idf
     version: 5.3.1
 direct_dependencies:
 - chmorgan/esp-audio-player
-- espressif/usb_host_uac
 - idf
-manifest_hash: 8176d48e94550bf4ea57cf90f5349bab0bc90306a0a31c0d058bcf3b510fc7a2
+manifest_hash: e1e8dfe3b77bc5b9a2bfc4edf5a757c9ef9e735f952fc108dd6f5f1bc3361c64
 target: esp32s3
 version: 2.0.0
