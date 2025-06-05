@@ -1,8 +1,6 @@
-// main.c
-// Mục đích: Phát MP3 từ SPIFFS qua I²S → MAX98357A (không mix, chỉ phát lặp)
 
 #include <stdio.h>
-#include <inttypes.h>
+//#include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_err.h"
@@ -10,10 +8,12 @@
 #include "esp_spiffs.h"
 #include "driver/i2s.h"
 #include "audio_player.h"
-#include "config.h"   // Đã định nghĩa i2s_speaker_config, i2s_speaker_pins, SAMPLE_RATE
+#include "config.h"   
 
 static const char *TAG = "mp3_i2s_player";
-
+// extern "C" {
+//     void app_main(void);
+// }
 // Đường dẫn file MP3 trong SPIFFS
 #define MP3_FILE_PATH  "/spiffs/new_epic.mp3"
 

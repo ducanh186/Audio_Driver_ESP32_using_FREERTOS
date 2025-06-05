@@ -1,7 +1,8 @@
 #pragma once
-
+#pragma GCC diagnostic ignored "-Wformat"
 #include <freertos/FreeRTOS.h>
 #include <driver/i2s.h>
+#include "driver/gpio.h"
 
 // sample rate
 #define SAMPLE_RATE 44100
